@@ -1,0 +1,16 @@
+{
+  "name": "transcribe",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "node-whisper": "^2024.11.13",
+    "openai": "^4.75.0"
+  }
+}
