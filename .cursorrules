@@ -2,3 +2,5 @@ use typescript
 use bun
 run tsc after each proposed change and make sure the types are correct
 prefer gpt-4o over gpt-4
+
+prefer await to .then()

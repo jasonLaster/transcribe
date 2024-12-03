@@ -59,7 +59,19 @@ async function generateFormattedScript(transcription: string) {
     messages: [
       {
         role: "system",
-        content: "You are an expert at formatting transcripts. Format the following transcript with speaker names and timestamps. Use your best judgment to identify different speakers and speaking patterns. Format it like this:\n\n[00:00] Speaker Name: text\n[00:30] Different Speaker: text"
+        content: `
+        You are an expert at formatting transcripts.
+        Format the following transcript with speaker names and timestamps.
+        Use your best judgment to identify different speakers and speaking patterns.
+        
+        Important: Ensure that NO words are dropped or omitted from the original transcript.
+        Preserve every single word while formatting.
+        
+        Format it like this:
+        [00:00] Speaker Name: text
+        [00:30] Different Speaker: text
+        
+        Remember to include ALL words from the original transcript in your formatted output.`
       },
       {
         role: "user",
@@ -69,6 +81,31 @@ async function generateFormattedScript(transcription: string) {
   });
 
   return completion.choices[0].message.content;
+}
+
+async function formatTranscription(transcription: string, outputDir: string) {
+  console.log('\nGenerating formatted script with speakers...');
+
+  const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  const interval = setInterval(() => {
+    process.stdout.write(`\rFormatting ${spinner[i]} `);
+    i = (i + 1) % spinner.length;
+  }, 100);
+
+  // Break transcript into 10 chunks for more reliable formatting
+  const formattedScript = await generateFormattedScript(transcription);
+
+  clearInterval(interval);
+  process.stdout.write('\r');
+
+  const formattedOutputFile = join(outputDir, 'transcription.formatted.txt');
+  await writeFile(formattedOutputFile, formattedScript);
+  console.log(`Formatted script saved in: ${formattedOutputFile}`);
+  console.log('\nFormatted Script Preview:');
+  console.log(formattedScript.slice(0, 500) + '...');
+
+  return formattedScript;
 }
 
 program
@@ -110,15 +147,15 @@ program
       }
 
       console.log(`Total duration: ${totalDuration} seconds`);
-      const chunks = Math.ceil(totalDuration / CHUNK_SIZE);
-      console.log(`Processing in ${chunks} chunks...`);
+      const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
+      console.log(`Processing in ${audioChunks} chunks...`);
 
       let fullTranscription = '';
-      for (let i = 0; i < chunks; i++) {
+      for (let i = 0; i < audioChunks; i++) {
         const chunkStart = i * CHUNK_SIZE;
         const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
 
-        console.log(`\nProcessing chunk ${i + 1}/${chunks} (${chunkDuration}s)...`);
+        console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
         const chunkText = await transcribeChunk(
           openai,
           audioFile,
@@ -144,26 +181,7 @@ program
       await writeFile(outputFile, fullTranscription);
       console.log(`\nTranscript saved in: ${outputFile}`);
 
-      // Generate formatted script
-      console.log('\nGenerating formatted script with speakers...');
-
-      const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-      let i = 0;
-      const interval = setInterval(() => {
-        process.stdout.write(`\rFormatting ${spinner[i]} `);
-        i = (i + 1) % spinner.length;
-      }, 100);
-
-      const formattedScript = await generateFormattedScript(fullTranscription);
-
-      clearInterval(interval);
-      process.stdout.write('\r');
-
-      const formattedOutputFile = join(outputDir, 'transcription.formatted.txt');
-      await writeFile(formattedOutputFile, formattedScript);
-      console.log(`Formatted script saved in: ${formattedOutputFile}`);
-      console.log('\nFormatted Script Preview:');
-      console.log(formattedScript.slice(0, 500) + '...');
+      await formatTranscription(fullTranscription, outputDir);
 
     } catch (error) {
       console.error('Error during transcription:', error);
@@ -185,29 +203,7 @@ program
       console.log('Reading transcription file...');
       const transcription = await readFile(file, 'utf-8');
 
-      console.log('\nGenerating formatted script with speakers...');
-
-      const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-      let i = 0;
-      const interval = setInterval(() => {
-        process.stdout.write(`\rFormatting ${spinner[i]} `);
-        i = (i + 1) % spinner.length;
-      }, 100);
-
-      const formattedScript = await generateFormattedScript(transcription);
-
-      clearInterval(interval);
-      process.stdout.write('\r');
-
-      if (!formattedScript) {
-        throw new Error('Failed to generate formatted script');
-      }
-
-      const formattedOutputFile = join(inputDir, `${inputFileName}.formatted.txt`);
-      await writeFile(formattedOutputFile, formattedScript);
-      console.log(`\nFormatted script saved in: ${formattedOutputFile}`);
-      console.log('\nFormatted Script Preview:');
-      console.log(formattedScript.slice(0, 500) + '...');
+      await formatTranscription(transcription, inputDir);
 
     } catch (error) {
       console.error('Error during formatting:', error);
