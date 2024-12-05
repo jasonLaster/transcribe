@@ -6,6 +6,7 @@ import { writeFile, mkdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { AssemblyAI } from 'assemblyai';
 
 const execAsync = promisify(exec);
 
@@ -14,6 +15,35 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const assemblyClient = new AssemblyAI({
+  apiKey: process.env.ASSEMBLYAI_API_KEY || ''
+});
+
+// Add this new type near the top of the file
+type FormattingModel = 'gpt';
+type TranscriptionModel = 'whisper' | 'assemblyai';
+
+// Add these types near the top of the file
+interface AssemblyAIUtterance {
+  text: string;
+  start: number;
+  speaker: string;
+}
+
+interface AssemblyAIResponse {
+  status: string;
+  error?: string;
+  utterances?: AssemblyAIUtterance[];
+}
+
+type TranscriptionService = 'whisper' | 'assemblyai';
+
+// Add this interface for LeMUR questions
+interface LemurQuestion {
+  question: string;
+  answer_format: string;
+}
+
 async function getAudioDuration(file: string): Promise<number> {
   const { stdout } = await execAsync(
     `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`
@@ -21,36 +51,129 @@ async function getAudioDuration(file: string): Promise<number> {
   return parseFloat(stdout.trim());
 }
 
+async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
+  console.log('Starting AssemblyAI transcription...');
+  const startTime = performance.now();
+
+  const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  const interval = setInterval(() => {
+    process.stdout.write(`\rProcessing ${spinner[i]} `);
+    i = (i + 1) % spinner.length;
+  }, 100);
+
+  try {
+    // First, get the transcript with speaker labels
+    const config = {
+      audio: audioFile,
+      speaker_labels: true,
+      speakers_expected: 5,
+      language_code: "en",
+      word_boost: ["Jake DeWitt", "Sam Doan", "Craig Bellmer"],
+      format_text: true,
+    };
+
+    const transcript = await assemblyClient.transcripts.transcribe(config);
+
+    if (!transcript.utterances) {
+      throw new Error('No utterances found in transcription');
+    }
+
+    // Create text with speaker labels for LeMUR
+    let text_with_speaker_labels = "";
+    for (const utt of transcript.utterances) {
+      text_with_speaker_labels += `Speaker ${utt.speaker}:\n${utt.text}\n`;
+    }
+
+    // Get unique speakers
+    const unique_speakers = new Set(transcript.utterances.map(utt => utt.speaker));
+
+    // Create questions for LeMUR
+    const questions: LemurQuestion[] = Array.from(unique_speakers).map(speaker => ({
+      question: `Who is speaker ${speaker}?`,
+      answer_format: "<First Name> <Last Name (if applicable)>"
+    }));
+
+    // Ask LeMUR to identify speakers
+    const result = await assemblyClient.lemur.questionAnswer({
+      questions,
+      input_text: text_with_speaker_labels,
+      context: "Your task is to infer the speaker's name from the speaker-labelled transcript"
+    });
+
+    // Create speaker mapping from LeMUR responses
+    const speakerMap = new Map<string, string>();
+    for (const qa_response of result.response) {
+      const match = qa_response.question.match(/Who is speaker (\w)\?/);
+      if (match && match[1] && !speakerMap.has(match[1])) {
+        speakerMap.set(match[1], qa_response.answer);
+      }
+    }
+
+    // Format transcript with identified speaker names
+    const segments = transcript.utterances.map((utterance, index, array) => {
+      const speakerName = speakerMap.get(utterance.speaker) || `Speaker ${utterance.speaker}`;
+      const timestamp = Math.floor(utterance.start / 1000);
+      const minutes = Math.floor(timestamp / 60);
+      const seconds = timestamp % 60;
+      const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
+
+      return `${timeStr} ${speakerName}: ${utterance.text}`;
+    });
+
+    const duration = Date.now() - startTime;
+    console.log(`AssemblyAI transcription complete in ${duration}ms`);
+    return segments.join('\n');
+  } catch (error) {
+    clearInterval(interval);
+    throw error;
+  }
+}
+
 async function transcribeChunk(
   openai: OpenAI,
   audioFile: string,
   startTime: number,
   duration: number,
-  outputDir: string
+  outputDir: string,
+  service: TranscriptionService = 'whisper'
 ): Promise<string> {
   const chunkFile = join(outputDir, `chunk-${startTime}.mp3`);
   await execAsync(
     `ffmpeg -i "${audioFile}" -ss ${startTime} -t ${duration} -vn -acodec libmp3lame "${chunkFile}"`
   );
 
-  const transcription = await openai.audio.transcriptions.create({
-    file: createReadStream(chunkFile),
-    model: 'whisper-1', // Already using fastest Whisper model
-    language: 'en',
-    response_format: 'verbose_json',
-    timestamp_granularities: ['segment'], // Removed 'word' granularity for speed
-  });
+  switch (service) {
+    case 'whisper':
+      const transcription = await openai.audio.transcriptions.create({
+        file: createReadStream(chunkFile),
+        model: 'whisper-1',
+        language: 'en',
+        response_format: 'verbose_json',
+        timestamp_granularities: ['segment'],
+      });
 
-  // Format the response with timestamps
-  const segments = transcription.segments.map(segment => {
-    const timestamp = Math.floor(segment.start + startTime);
-    const minutes = Math.floor(timestamp / 60);
-    const seconds = timestamp % 60;
-    const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
-    return `${timeStr} ${segment.text.trim()}`;
-  });
+      if (!transcription.segments) {
+        throw new Error('No segments found in transcription');
+      }
 
-  return segments.join('\n');
+      // Format the response with timestamps
+      const segments = transcription.segments.map(segment => {
+        const timestamp = Math.floor(segment.start + startTime);
+        const minutes = Math.floor(timestamp / 60);
+        const seconds = timestamp % 60;
+        const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
+        return `${timeStr} ${segment.text.trim()}`;
+      });
+
+      return segments.join('\n');
+
+    case 'assemblyai':
+      return await transcribeWithAssemblyAI(chunkFile);
+
+    default:
+      throw new Error(`Unsupported transcription service: ${service}`);
+  }
 }
 
 async function generateFormattedScript(transcription: string) {
@@ -83,8 +206,11 @@ async function generateFormattedScript(transcription: string) {
   return completion.choices[0].message.content;
 }
 
-async function formatTranscription(transcription: string, outputDir: string) {
-  console.log('\nGenerating formatted script with speakers...');
+async function formatTranscription(
+  transcription: string,
+  outputDir: string,
+): Promise<string> {
+  console.log('\nGenerating formatted script with speakers using GPT...');
 
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let i = 0;
@@ -93,8 +219,17 @@ async function formatTranscription(transcription: string, outputDir: string) {
     i = (i + 1) % spinner.length;
   }, 100);
 
-  // Break transcript into 10 chunks for more reliable formatting
-  const formattedScript = await generateFormattedScript(transcription);
+  let formattedScript: string;
+  try {
+    formattedScript = await generateFormattedScript(transcription);
+  } catch (error) {
+    clearInterval(interval);
+    throw error;
+  }
+
+  if (!formattedScript) {
+    throw new Error('Failed to generate formatted script');
+  }
 
   clearInterval(interval);
   process.stdout.write('\r');
@@ -112,9 +247,12 @@ program
   .name('transcribe-cloud')
   .description('Transcribe video files using OpenAI Whisper API')
   .command('transcribe')
+  .description('Transcribe video files using AssemblyAI or Whisper')
   .argument('<file>', 'video file to transcribe')
   .option('-d, --duration <minutes>', 'duration to transcribe in minutes')
   .option('-o, --offset <minutes>', 'start time offset in minutes', '0')
+  .option('-f, --format', 'format transcript with GPT-4', false)
+  .option('-t, --service <service>', 'transcription service to use (assemblyai or whisper)', 'assemblyai')
   .action(async (file, options) => {
     try {
       const startTime = performance.now();
@@ -122,14 +260,11 @@ program
       const outputDir = join('output', timestamp);
       await mkdir(outputDir, { recursive: true });
 
-      console.log('Starting transcription...');
-      console.log('Using OpenAI Whisper API');
+      console.log('Starting transcription process...');
+      console.log(`Using ${options.service.toUpperCase()} for transcription`);
 
       const startSeconds = parseFloat(options.offset) * 60;
       const duration = options.duration ? parseFloat(options.duration) * 60 : undefined;
-
-      const CHUNK_SIZE = 24 * 60; // 24 minutes per chunk
-      const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB limit
 
       let audioFile = file;
       let totalDuration: number;
@@ -147,41 +282,46 @@ program
       }
 
       console.log(`Total duration: ${totalDuration} seconds`);
-      const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
-      console.log(`Processing in ${audioChunks} chunks...`);
 
-      let fullTranscription = '';
-      for (let i = 0; i < audioChunks; i++) {
-        const chunkStart = i * CHUNK_SIZE;
-        const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
+      // For AssemblyAI, we don't need to chunk the file
+      let fullTranscription: string;
+      if (options.service === 'assemblyai') {
+        fullTranscription = await transcribeWithAssemblyAI(audioFile);
+      } else {
+        // Existing Whisper chunking logic...
+        const CHUNK_SIZE = 24 * 60;
+        const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
+        console.log(`Processing in ${audioChunks} chunks...`);
 
-        console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
-        const chunkText = await transcribeChunk(
-          openai,
-          audioFile,
-          chunkStart,
-          chunkDuration,
-          outputDir
-        );
-
-        fullTranscription += chunkText + '\n';
-
-        // Save intermediate results
-        await writeFile(
-          join(outputDir, 'transcription-in-progress.txt'),
-          fullTranscription
-        );
+        fullTranscription = '';
+        for (let i = 0; i < audioChunks; i++) {
+          const chunkStart = i * CHUNK_SIZE;
+          const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
+          console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
+          const chunkText = await transcribeChunk(
+            openai,
+            audioFile,
+            chunkStart,
+            chunkDuration,
+            outputDir,
+            'whisper'
+          );
+          fullTranscription += chunkText + '\n';
+        }
       }
 
       const duration_seconds = ((performance.now() - startTime) / 1000).toFixed(1);
       console.log(`\nTranscription completed in ${duration_seconds}s`);
 
-      // Save the final transcription
+      // Save the transcription
       const outputFile = join(outputDir, 'transcription.txt');
       await writeFile(outputFile, fullTranscription);
       console.log(`\nTranscript saved in: ${outputFile}`);
 
-      await formatTranscription(fullTranscription, outputDir);
+      // Format the transcription if requested
+      if (options.format) {
+        await formatTranscription(fullTranscription, outputDir);
+      }
 
     } catch (error) {
       console.error('Error during transcription:', error);
@@ -196,15 +336,9 @@ program
   .argument('<file>', 'transcription file to format')
   .action(async (file) => {
     try {
-      // Get the directory of the input file
       const inputDir = join(file, '..');
-      const inputFileName = file.split('/').pop()?.replace('.txt', '') || 'transcript';
-
-      console.log('Reading transcription file...');
       const transcription = await readFile(file, 'utf-8');
-
       await formatTranscription(transcription, inputDir);
-
     } catch (error) {
       console.error('Error during formatting:', error);
       process.exit(1);

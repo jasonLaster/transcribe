@@ -3,3 +3,4 @@ input
 output
 venv
 app/.next
+.env
