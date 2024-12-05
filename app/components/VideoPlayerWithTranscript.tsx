@@ -2,8 +2,15 @@
 import React, { useState, useRef } from 'react';
 import { formatTime } from '../utils/formatTime';
 import { parseTranscript } from '../utils/parseTranscript';
-import {  useEffect } from 'react';
+import { useEffect } from 'react';
 import { TranscriptEntry } from '@/data/transcript';
+
+interface SlideReference {
+  timestamp: string;
+  slideNumber: number;
+  title: string;
+  context: string;
+}
 
 interface Props {
   videoSrc: string;
@@ -14,18 +21,24 @@ export default function VideoPlayerWithTranscript({ videoSrc }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-
+  const [slides, setSlides] = useState<SlideReference[]>([]);
 
   useEffect(() => {
+    // Fetch transcript
     fetch(`${videoSrc.replace('/video.mp4', '')}/transcript.txt`)
       .then(response => response.text())
       .then(text => {
         const parsed = parseTranscript(text);
-        console.log('Parsed transcript:', parsed);
         setTranscript(parsed);
       });
-  }, [videoSrc]);
 
+    // Fetch slides
+    fetch(`${videoSrc.replace('/video.mp4', '')}/slides.json`)
+      .then(response => response.json())
+      .then(data => {
+        setSlides(data.references);
+      });
+  }, [videoSrc]);
 
   // Update current time when video plays
   const handleTimeUpdate = () => {
@@ -39,6 +52,17 @@ export default function VideoPlayerWithTranscript({ videoSrc }: Props) {
     if (videoRef.current) {
       videoRef.current.currentTime = start;
       setCurrentTime(start);
+      videoRef.current.play();
+    }
+  };
+
+  // Handle clicking on slide
+  const handleSlideClick = (timestamp: string) => {
+    if (videoRef.current) {
+      const [minutes, seconds] = timestamp.split(':').map(Number);
+      const timeInSeconds = minutes * 60 + seconds;
+      videoRef.current.currentTime = timeInSeconds;
+      setCurrentTime(timeInSeconds);
       videoRef.current.play();
     }
   };
@@ -59,17 +83,38 @@ export default function VideoPlayerWithTranscript({ videoSrc }: Props) {
   };
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div>
-        <video
-          ref={videoRef}
-          onTimeUpdate={handleTimeUpdate}
-          controls
-          className="w-full"
-          src={videoSrc}
-        />
+    <div className="grid grid-cols-1 md:grid-cols-[1fr,800px] gap-4">
+      <div className="flex flex-col gap-4">
+        <div>
+          <video
+            ref={videoRef}
+            onTimeUpdate={handleTimeUpdate}
+            controls
+            className="w-full"
+            src={videoSrc}
+          />
+        </div>
+        
+        {/* Slides Section */}
+        <div className="border rounded p-4">
+          <h2 className="text-xl font-semibold mb-4">Slides</h2>
+          <div className="space-y-2">
+            {slides.map((slide) => (
+              <div
+                key={`${slide.slideNumber}-${slide.timestamp}`}
+                onClick={() => handleSlideClick(slide.timestamp)}
+                className="p-3 border rounded cursor-pointer hover:bg-gray-50 transition-colors flex items-center gap-4"
+              >
+                <span className="font-mono text-sm text-gray-500 w-16">Slide {slide.slideNumber}</span>
+                <h3 className="font-medium flex-1">{slide.title}</h3>
+                <span className="text-sm text-gray-500">{slide.timestamp}</span>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
-      <div className="flex flex-col h-[600px] border rounded">
+
+      <div className="flex flex-col h-[calc(100vh-2rem)] border rounded">
         <div className="p-2 border-b bg-gray-50 sticky top-0">
           <button
             onClick={jumpToCurrentSegment}

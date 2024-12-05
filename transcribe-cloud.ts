@@ -124,9 +124,8 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<Transcriptio
       const config = {
         audio_url: uploadUrl,
         speaker_labels: true,
-        speakers_expected: 5,
+        speakers_expected: 10,
         language_code: "en",
-        word_boost: ["Jake DeWitt", "Sam Doan", "Craig Bellmer"],
         format_text: true,
       };
 
@@ -371,24 +370,28 @@ function consolidateSegments(transcript: string): string {
   // Consolidate segments
   const consolidated: TranscriptSegment[] = [];
   let current: TranscriptSegment | null = null;
+  let currentStartTime: number | null = null;
 
   for (const segment of segments) {
     if (!current) {
       current = segment;
+      currentStartTime = segment.timestamp;
       continue;
     }
 
     const timeDiff = segment.timestamp - current.timestamp;
+    const totalTimeDiff = segment.timestamp - (currentStartTime || segment.timestamp);
     const isSameSpeaker = segment.speaker === current.speaker;
-    const isUnderMinute = timeDiff < 60;
+    const isUnderTimeLimit = totalTimeDiff < 30; // Check total time from start of consolidated segment (30s limit)
     const startsWithSlide = segment.text.toLowerCase().trim().startsWith('going to slide') ||
       segment.text.toLowerCase().trim().startsWith('slide');
 
-    if (isSameSpeaker && isUnderMinute && !startsWithSlide) {
+    if (isSameSpeaker && isUnderTimeLimit && !startsWithSlide) {
       current.text += ' ' + segment.text;
     } else {
       consolidated.push(current);
       current = segment;
+      currentStartTime = segment.timestamp;
     }
   }
 
