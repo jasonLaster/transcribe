@@ -44,6 +44,11 @@ interface LemurQuestion {
   answer_format: string;
 }
 
+interface TranscriptionResult {
+  raw: string;
+  consolidated: string;
+}
+
 async function getAudioDuration(file: string): Promise<number> {
   const { stdout } = await execAsync(
     `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`
@@ -51,21 +56,25 @@ async function getAudioDuration(file: string): Promise<number> {
   return parseFloat(stdout.trim());
 }
 
-async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
+async function transcribeWithAssemblyAI(audioFile: string): Promise<TranscriptionResult> {
   console.log('Starting AssemblyAI transcription...');
   const startTime = performance.now();
 
-  const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  let i = 0;
-  const interval = setInterval(() => {
-    process.stdout.write(`\rProcessing ${spinner[i]} `);
-    i = (i + 1) % spinner.length;
-  }, 100);
-
   try {
-    // First, get the transcript with speaker labels
+    // Upload progress
+    console.log('Uploading audio file...');
+    const fileSize = (await stat(audioFile)).size;
+    const uploadResponse = await assemblyClient.files.upload(audioFile, {
+      onProgress: (bytes) => {
+        const progress = Math.round((bytes / fileSize) * 100);
+        process.stdout.write(`\rUploading: ${progress}%`);
+      }
+    });
+    process.stdout.write('\rUpload complete!      \n');
+
+    // Start transcription
     const config = {
-      audio: audioFile,
+      audio_url: uploadResponse,  // AssemblyAI SDK handles the URL internally
       speaker_labels: true,
       speakers_expected: 5,
       language_code: "en",
@@ -73,20 +82,51 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
       format_text: true,
     };
 
-    const transcript = await assemblyClient.transcripts.transcribe(config);
+    console.log('Starting transcription...');
+    const transcriptResponse = await assemblyClient.transcripts.create(config);
 
-    if (!transcript.utterances) {
+    // Poll for completion with better progress reporting
+    let transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
+    let lastStatus = '';
+
+    while (transcriptResult.status !== 'completed') {
+      if (transcriptResult.status === 'error') {
+        throw new Error(`Transcription failed: ${transcriptResult.error}`);
+      }
+
+      // Show detailed status
+      const status = (() => {
+        switch (transcriptResult.status) {
+          case 'queued': return 'Queued in processing line...';
+          case 'processing': return 'Processing audio...';
+          case 'analyzing': return 'Analyzing speakers...';
+          default: return transcriptResult.status;
+        }
+      })();
+
+      if (status !== lastStatus) {
+        console.log(status);
+        lastStatus = status;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
+    }
+
+    console.log('Transcription complete! Processing results...');
+
+    if (!transcriptResult.utterances) {
       throw new Error('No utterances found in transcription');
     }
 
     // Create text with speaker labels for LeMUR
     let text_with_speaker_labels = "";
-    for (const utt of transcript.utterances) {
+    for (const utt of transcriptResult.utterances) {
       text_with_speaker_labels += `Speaker ${utt.speaker}:\n${utt.text}\n`;
     }
 
     // Get unique speakers
-    const unique_speakers = new Set(transcript.utterances.map(utt => utt.speaker));
+    const unique_speakers = new Set(transcriptResult.utterances.map(utt => utt.speaker));
 
     // Create questions for LeMUR
     const questions: LemurQuestion[] = Array.from(unique_speakers).map(speaker => ({
@@ -95,7 +135,7 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
     }));
 
     // Ask LeMUR to identify speakers
-    const result = await assemblyClient.lemur.questionAnswer({
+    const lemurResult = await assemblyClient.lemur.questionAnswer({
       questions,
       input_text: text_with_speaker_labels,
       context: "Your task is to infer the speaker's name from the speaker-labelled transcript"
@@ -103,15 +143,15 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
 
     // Create speaker mapping from LeMUR responses
     const speakerMap = new Map<string, string>();
-    for (const qa_response of result.response) {
+    for (const qa_response of lemurResult.response) {
       const match = qa_response.question.match(/Who is speaker (\w)\?/);
       if (match && match[1] && !speakerMap.has(match[1])) {
         speakerMap.set(match[1], qa_response.answer);
       }
     }
 
-    // Format transcript with identified speaker names
-    const segments = transcript.utterances.map((utterance, index, array) => {
+    // Format transcript with identified speaker names - use transcriptResult instead of lemurResult
+    const segments = transcriptResult.utterances.map((utterance) => {
       const speakerName = speakerMap.get(utterance.speaker) || `Speaker ${utterance.speaker}`;
       const timestamp = Math.floor(utterance.start / 1000);
       const minutes = Math.floor(timestamp / 60);
@@ -121,11 +161,17 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<string> {
       return `${timeStr} ${speakerName}: ${utterance.text}`;
     });
 
+    const rawTranscript = segments.join('\n');
+    const consolidatedTranscript = consolidateSegments(rawTranscript);
+
     const duration = Date.now() - startTime;
     console.log(`AssemblyAI transcription complete in ${duration}ms`);
-    return segments.join('\n');
+
+    return {
+      raw: rawTranscript,
+      consolidated: consolidatedTranscript
+    };
   } catch (error) {
-    clearInterval(interval);
     throw error;
   }
 }
@@ -137,7 +183,7 @@ async function transcribeChunk(
   duration: number,
   outputDir: string,
   service: TranscriptionService = 'whisper'
-): Promise<string> {
+): Promise<TranscriptionResult> {
   const chunkFile = join(outputDir, `chunk-${startTime}.mp3`);
   await execAsync(
     `ffmpeg -i "${audioFile}" -ss ${startTime} -t ${duration} -vn -acodec libmp3lame "${chunkFile}"`
@@ -166,7 +212,11 @@ async function transcribeChunk(
         return `${timeStr} ${segment.text.trim()}`;
       });
 
-      return segments.join('\n');
+      const raw = segments.join('\n');
+      return {
+        raw,
+        consolidated: consolidateSegments(raw)
+      };
 
     case 'assemblyai':
       return await transcribeWithAssemblyAI(chunkFile);
@@ -243,6 +293,121 @@ async function formatTranscription(
   return formattedScript;
 }
 
+interface TranscriptSegment {
+  timestamp: number;
+  speaker: string;
+  text: string;
+}
+
+function consolidateSegments(transcript: string): string {
+  // Parse the transcript into segments
+  const segments: TranscriptSegment[] = transcript.split('\n').map(line => {
+    const match = line.match(/\[(\d{2}):(\d{2})\] (.*?): (.*)/);
+    if (!match) return null;
+    const [_, minutes, seconds, speaker, text] = match;
+    return {
+      timestamp: parseInt(minutes) * 60 + parseInt(seconds),
+      speaker,
+      text,
+    };
+  }).filter((s): s is TranscriptSegment => s !== null);
+
+  // Consolidate segments
+  const consolidated: TranscriptSegment[] = [];
+  let current: TranscriptSegment | null = null;
+
+  for (const segment of segments) {
+    if (!current) {
+      current = segment;
+      continue;
+    }
+
+    const timeDiff = segment.timestamp - current.timestamp;
+    const isSameSpeaker = segment.speaker === current.speaker;
+    const isUnderMinute = timeDiff < 60;
+    const startsWithSlide = segment.text.toLowerCase().trim().startsWith('going to slide') ||
+      segment.text.toLowerCase().trim().startsWith('slide');
+
+    if (isSameSpeaker && isUnderMinute && !startsWithSlide) {
+      current.text += ' ' + segment.text;
+    } else {
+      consolidated.push(current);
+      current = segment;
+    }
+  }
+
+  if (current) {
+    consolidated.push(current);
+  }
+
+  // Format back to string
+  return consolidated.map(segment => {
+    const minutes = Math.floor(segment.timestamp / 60);
+    const seconds = segment.timestamp % 60;
+    const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
+    return `${timeStr} ${segment.speaker}: ${segment.text}`;
+  }).join('\n');
+}
+
+interface SlideReference {
+  timestamp: string;
+  slideNumber?: number;
+  context: string;
+}
+
+async function extractSlideTimestamps(transcript: string): Promise<SlideReference[]> {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "system",
+        content: `
+        Analyze the transcript and identify ALL mentions of slides.
+        For each mention, extract:
+        1. The timestamp
+        2. The slide number if mentioned
+        3. The context of what was being discussed
+        
+        You must respond with a JSON object containing an array of slide references.
+        Format your response as a JSON object with this structure:
+        {
+          "slides": [
+            {
+              "timestamp": "MM:SS",
+              "slideNumber": number or null,
+              "context": "brief description of what was being discussed"
+            }
+          ]
+        }`
+      },
+      {
+        role: "user",
+        content: transcript
+      }
+    ],
+    response_format: { type: "json_object" },
+  });
+
+  try {
+    const response = JSON.parse(completion.choices[0].message.content || '{"slides": []}');
+    return response.slides as SlideReference[];
+  } catch (error) {
+    console.error('Failed to parse slide references:', error);
+    return [];
+  }
+}
+
+// Update the slides data structure
+interface SlidesData {
+  references: SlideReference[];
+  uniqueSlides: Array<{
+    id: number;
+    firstMention: string;
+    allMentions: string[];
+    context: string;
+  }>;
+}
+
 program
   .name('transcribe-cloud')
   .description('Transcribe video files using OpenAI Whisper API')
@@ -252,6 +417,7 @@ program
   .option('-d, --duration <minutes>', 'duration to transcribe in minutes')
   .option('-o, --offset <minutes>', 'start time offset in minutes', '0')
   .option('-f, --format', 'format transcript with GPT-4', false)
+  .option('-s, --slides', 'extract slide timestamps', false)
   .option('-t, --service <service>', 'transcription service to use (assemblyai or whisper)', 'assemblyai')
   .action(async (file, options) => {
     try {
@@ -284,7 +450,7 @@ program
       console.log(`Total duration: ${totalDuration} seconds`);
 
       // For AssemblyAI, we don't need to chunk the file
-      let fullTranscription: string;
+      let fullTranscription: TranscriptionResult;
       if (options.service === 'assemblyai') {
         fullTranscription = await transcribeWithAssemblyAI(audioFile);
       } else {
@@ -293,12 +459,12 @@ program
         const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
         console.log(`Processing in ${audioChunks} chunks...`);
 
-        fullTranscription = '';
+        let rawParts: string[] = [];
         for (let i = 0; i < audioChunks; i++) {
           const chunkStart = i * CHUNK_SIZE;
           const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
           console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
-          const chunkText = await transcribeChunk(
+          const chunkResult = await transcribeChunk(
             openai,
             audioFile,
             chunkStart,
@@ -306,21 +472,73 @@ program
             outputDir,
             'whisper'
           );
-          fullTranscription += chunkText + '\n';
+          rawParts.push(chunkResult.raw);
         }
+
+        const rawTranscription = rawParts.join('\n');
+        fullTranscription = {
+          raw: rawTranscription,
+          consolidated: consolidateSegments(rawTranscription)
+        };
       }
 
       const duration_seconds = ((performance.now() - startTime) / 1000).toFixed(1);
       console.log(`\nTranscription completed in ${duration_seconds}s`);
 
-      // Save the transcription
-      const outputFile = join(outputDir, 'transcription.txt');
-      await writeFile(outputFile, fullTranscription);
-      console.log(`\nTranscript saved in: ${outputFile}`);
+      // Save both versions
+      const rawOutputFile = join(outputDir, 'transcription.raw.txt');
+      const consolidatedOutputFile = join(outputDir, 'transcription.txt');
+      await writeFile(rawOutputFile, fullTranscription.raw);
+      await writeFile(consolidatedOutputFile, fullTranscription.consolidated);
+      console.log(`\nRaw transcript saved in: ${rawOutputFile}`);
+      console.log(`Consolidated transcript saved in: ${consolidatedOutputFile}`);
+
+      // Extract slide timestamps if requested
+      if (options.slides) {
+        console.log('\nExtracting slide references...');
+        const slideRefs = await extractSlideTimestamps(fullTranscription.raw);
+
+        // Group by slide number and create unique slides data
+        const slideMap = new Map<number, {
+          mentions: string[];
+          firstMention: string;
+          context: string;
+        }>();
+
+        slideRefs.forEach(ref => {
+          if (ref.slideNumber) {
+            if (!slideMap.has(ref.slideNumber)) {
+              slideMap.set(ref.slideNumber, {
+                mentions: [ref.timestamp],
+                firstMention: ref.timestamp,
+                context: ref.context
+              });
+            } else {
+              slideMap.get(ref.slideNumber)?.mentions.push(ref.timestamp);
+            }
+          }
+        });
+
+        const slidesData: SlidesData = {
+          references: slideRefs,
+          uniqueSlides: Array.from(slideMap.entries()).map(([num, data]) => ({
+            id: num,
+            firstMention: data.firstMention,
+            allMentions: data.mentions,
+            context: data.context
+          }))
+        };
+
+        const slidesFile = join(outputDir, 'slides.json');
+        await writeFile(slidesFile, JSON.stringify(slidesData, null, 2));
+        console.log('Slide references:', slideRefs.length);
+        console.log('Unique slides:', slidesData.uniqueSlides.length);
+        console.log(`Slide data saved in: ${slidesFile}`);
+      }
 
       // Format the transcription if requested
       if (options.format) {
-        await formatTranscription(fullTranscription, outputDir);
+        await formatTranscription(fullTranscription.raw, outputDir);
       }
 
     } catch (error) {

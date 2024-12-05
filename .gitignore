@@ -4,3 +4,4 @@ output
 venv
 app/.next
 .env
+.DS_Store
