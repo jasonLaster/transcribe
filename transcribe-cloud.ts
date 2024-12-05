@@ -2,8 +2,8 @@
 import { program } from 'commander';
 import OpenAI from 'openai';
 import { createReadStream } from 'node:fs';
-import { writeFile, mkdir, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { writeFile, mkdir, readFile, stat, unlink } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { AssemblyAI } from 'assemblyai';
@@ -61,116 +61,172 @@ async function transcribeWithAssemblyAI(audioFile: string): Promise<Transcriptio
   const startTime = performance.now();
 
   try {
+    // Extract audio to MP3 first
+    console.log('Extracting audio...');
+    const outputDir = dirname(audioFile);
+    const audioPath = join(outputDir, 'temp-audio.mp3');
+
+    // Use a more efficient audio extraction
+    await execAsync(
+      `ffmpeg -i "${audioFile}" -vn -acodec libmp3lame -q:a 4 -map_metadata -1 "${audioPath}"`
+    );
+    console.log('Audio extraction complete');
+
     // Upload progress
     console.log('Uploading audio file...');
-    const fileSize = (await stat(audioFile)).size;
-    const uploadResponse = await assemblyClient.files.upload(audioFile, {
-      onProgress: (bytes) => {
-        const progress = Math.round((bytes / fileSize) * 100);
-        process.stdout.write(`\rUploading: ${progress}%`);
-      }
-    });
-    process.stdout.write('\rUpload complete!      \n');
 
-    // Start transcription
-    const config = {
-      audio_url: uploadResponse,  // AssemblyAI SDK handles the URL internally
-      speaker_labels: true,
-      speakers_expected: 5,
-      language_code: "en",
-      word_boost: ["Jake DeWitt", "Sam Doan", "Craig Bellmer"],
-      format_text: true,
-    };
+    // Create form data with chunked file reading
+    const fileBuffer = await readFile(audioPath);
+    const formData = new FormData();
+    formData.append('file', new Blob([fileBuffer], { type: 'audio/mpeg' }));
 
-    console.log('Starting transcription...');
-    const transcriptResponse = await assemblyClient.transcripts.create(config);
+    try {
+      // Upload with retries
+      let uploadUrl: string | null = null;
+      let attempts = 0;
+      const maxAttempts = 3;
 
-    // Poll for completion with better progress reporting
-    let transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
-    let lastStatus = '';
+      while (attempts < maxAttempts && !uploadUrl) {
+        try {
+          const response = await fetch('https://api.assemblyai.com/v2/upload', {
+            method: 'POST',
+            headers: {
+              'Authorization': process.env.ASSEMBLYAI_API_KEY || ''
+            },
+            body: formData
+          });
 
-    while (transcriptResult.status !== 'completed') {
-      if (transcriptResult.status === 'error') {
-        throw new Error(`Transcription failed: ${transcriptResult.error}`);
-      }
+          if (!response.ok) {
+            throw new Error(`Upload failed with status ${response.status}: ${response.statusText}`);
+          }
 
-      // Show detailed status
-      const status = (() => {
-        switch (transcriptResult.status) {
-          case 'queued': return 'Queued in processing line...';
-          case 'processing': return 'Processing audio...';
-          case 'analyzing': return 'Analyzing speakers...';
-          default: return transcriptResult.status;
+          const data = await response.json();
+          uploadUrl = data.upload_url;
+          console.log('Upload complete!');
+        } catch (error) {
+          attempts++;
+          console.error(`Upload attempt ${attempts} failed:`, error);
+
+          if (attempts === maxAttempts) {
+            throw new Error(`Failed to upload after ${maxAttempts} attempts`);
+          }
+
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
-      })();
-
-      if (status !== lastStatus) {
-        console.log(status);
-        lastStatus = status;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
-    }
+      if (!uploadUrl) {
+        throw new Error('Upload failed - no upload URL received');
+      }
 
-    console.log('Transcription complete! Processing results...');
+      // Start transcription
+      const config = {
+        audio_url: uploadUrl,
+        speaker_labels: true,
+        speakers_expected: 5,
+        language_code: "en",
+        word_boost: ["Jake DeWitt", "Sam Doan", "Craig Bellmer"],
+        format_text: true,
+      };
 
-    if (!transcriptResult.utterances) {
-      throw new Error('No utterances found in transcription');
-    }
+      console.log('Starting transcription...');
+      const transcriptResponse = await assemblyClient.transcripts.create(config);
 
-    // Create text with speaker labels for LeMUR
-    let text_with_speaker_labels = "";
-    for (const utt of transcriptResult.utterances) {
-      text_with_speaker_labels += `Speaker ${utt.speaker}:\n${utt.text}\n`;
-    }
+      // Poll for completion with better progress reporting
+      let transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
+      let lastStatus = '';
 
-    // Get unique speakers
-    const unique_speakers = new Set(transcriptResult.utterances.map(utt => utt.speaker));
+      while (transcriptResult.status !== 'completed') {
+        if (transcriptResult.status === 'error') {
+          throw new Error(`Transcription failed: ${transcriptResult.error}`);
+        }
 
-    // Create questions for LeMUR
-    const questions: LemurQuestion[] = Array.from(unique_speakers).map(speaker => ({
-      question: `Who is speaker ${speaker}?`,
-      answer_format: "<First Name> <Last Name (if applicable)>"
-    }));
+        // Show detailed status
+        const status = (() => {
+          switch (transcriptResult.status) {
+            case 'queued': return 'Queued in processing line...';
+            case 'processing': return 'Processing audio...';
+            case 'analyzing': return 'Analyzing speakers...';
+            default: return transcriptResult.status;
+          }
+        })();
 
-    // Ask LeMUR to identify speakers
-    const lemurResult = await assemblyClient.lemur.questionAnswer({
-      questions,
-      input_text: text_with_speaker_labels,
-      context: "Your task is to infer the speaker's name from the speaker-labelled transcript"
-    });
+        if (status !== lastStatus) {
+          console.log(status);
+          lastStatus = status;
+        }
 
-    // Create speaker mapping from LeMUR responses
-    const speakerMap = new Map<string, string>();
-    for (const qa_response of lemurResult.response) {
-      const match = qa_response.question.match(/Who is speaker (\w)\?/);
-      if (match && match[1] && !speakerMap.has(match[1])) {
-        speakerMap.set(match[1], qa_response.answer);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        transcriptResult = await assemblyClient.transcripts.get(transcriptResponse.id);
+      }
+
+      console.log('Transcription complete! Processing results...');
+
+      if (!transcriptResult.utterances) {
+        throw new Error('No utterances found in transcription');
+      }
+
+      // Create text with speaker labels for LeMUR
+      let text_with_speaker_labels = "";
+      for (const utt of transcriptResult.utterances) {
+        text_with_speaker_labels += `Speaker ${utt.speaker}:\n${utt.text}\n`;
+      }
+
+      // Get unique speakers
+      const unique_speakers = new Set(transcriptResult.utterances.map(utt => utt.speaker));
+
+      // Create questions for LeMUR
+      const questions: LemurQuestion[] = Array.from(unique_speakers).map(speaker => ({
+        question: `Who is speaker ${speaker}?`,
+        answer_format: "<First Name> <Last Name (if applicable)>"
+      }));
+
+      // Ask LeMUR to identify speakers
+      const lemurResult = await assemblyClient.lemur.questionAnswer({
+        questions,
+        input_text: text_with_speaker_labels,
+        context: "Your task is to infer the speaker's name from the speaker-labelled transcript"
+      });
+
+      // Create speaker mapping from LeMUR responses
+      const speakerMap = new Map<string, string>();
+      for (const qa_response of lemurResult.response) {
+        const match = qa_response.question.match(/Who is speaker (\w)\?/);
+        if (match && match[1] && !speakerMap.has(match[1])) {
+          speakerMap.set(match[1], qa_response.answer);
+        }
+      }
+
+      // Format transcript with identified speaker names - use transcriptResult instead of lemurResult
+      const segments = transcriptResult.utterances.map((utterance) => {
+        const speakerName = speakerMap.get(utterance.speaker) || `Speaker ${utterance.speaker}`;
+        const timestamp = Math.floor(utterance.start / 1000);
+        const minutes = Math.floor(timestamp / 60);
+        const seconds = timestamp % 60;
+        const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
+
+        return `${timeStr} ${speakerName}: ${utterance.text}`;
+      });
+
+      const rawTranscript = segments.join('\n');
+      const consolidatedTranscript = consolidateSegments(rawTranscript);
+
+      const duration = Date.now() - startTime;
+      console.log(`AssemblyAI transcription complete in ${duration}ms`);
+
+      return {
+        raw: rawTranscript,
+        consolidated: consolidatedTranscript
+      };
+    } finally {
+      // Clean up the temporary audio file
+      try {
+        await unlink(audioPath);
+      } catch (error) {
+        console.error('Failed to clean up temporary audio file:', error);
       }
     }
-
-    // Format transcript with identified speaker names - use transcriptResult instead of lemurResult
-    const segments = transcriptResult.utterances.map((utterance) => {
-      const speakerName = speakerMap.get(utterance.speaker) || `Speaker ${utterance.speaker}`;
-      const timestamp = Math.floor(utterance.start / 1000);
-      const minutes = Math.floor(timestamp / 60);
-      const seconds = timestamp % 60;
-      const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
-
-      return `${timeStr} ${speakerName}: ${utterance.text}`;
-    });
-
-    const rawTranscript = segments.join('\n');
-    const consolidatedTranscript = consolidateSegments(rawTranscript);
-
-    const duration = Date.now() - startTime;
-    console.log(`AssemblyAI transcription complete in ${duration}ms`);
-
-    return {
-      raw: rawTranscript,
-      consolidated: consolidatedTranscript
-    };
   } catch (error) {
     throw error;
   }
@@ -352,6 +408,7 @@ function consolidateSegments(transcript: string): string {
 interface SlideReference {
   timestamp: string;
   slideNumber?: number;
+  title?: string;
   context: string;
 }
 
@@ -366,7 +423,8 @@ async function extractSlideTimestamps(transcript: string): Promise<SlideReferenc
         For each mention, extract:
         1. The timestamp
         2. The slide number if mentioned
-        3. The context of what was being discussed
+        3. The slide title if mentioned or can be inferred from context
+        4. The context of what was being discussed
         
         You must respond with a JSON object containing an array of slide references.
         Format your response as a JSON object with this structure:
@@ -375,6 +433,7 @@ async function extractSlideTimestamps(transcript: string): Promise<SlideReferenc
             {
               "timestamp": "MM:SS",
               "slideNumber": number or null,
+              "title": "slide title or null if not mentioned",
               "context": "brief description of what was being discussed"
             }
           ]
@@ -402,6 +461,7 @@ interface SlidesData {
   references: SlideReference[];
   uniqueSlides: Array<{
     id: number;
+    title: string | null;
     firstMention: string;
     allMentions: string[];
     context: string;
@@ -417,7 +477,7 @@ program
   .option('-d, --duration <minutes>', 'duration to transcribe in minutes')
   .option('-o, --offset <minutes>', 'start time offset in minutes', '0')
   .option('-f, --format', 'format transcript with GPT-4', false)
-  .option('-s, --slides', 'extract slide timestamps', false)
+  .option('-s, --no-slides', 'disable slide extraction', false)
   .option('-t, --service <service>', 'transcription service to use (assemblyai or whisper)', 'assemblyai')
   .action(async (file, options) => {
     try {
@@ -493,36 +553,44 @@ program
       console.log(`\nRaw transcript saved in: ${rawOutputFile}`);
       console.log(`Consolidated transcript saved in: ${consolidatedOutputFile}`);
 
-      // Extract slide timestamps if requested
-      if (options.slides) {
+      // Extract slide timestamps by default unless disabled
+      if (!options.noSlides) {
         console.log('\nExtracting slide references...');
         const slideRefs = await extractSlideTimestamps(fullTranscription.raw);
 
         // Group by slide number and create unique slides data
         const slideMap = new Map<number, {
+          title: string | null;
           mentions: string[];
           firstMention: string;
           context: string;
         }>();
 
-        slideRefs.forEach(ref => {
+        for (const ref of slideRefs) {
           if (ref.slideNumber) {
             if (!slideMap.has(ref.slideNumber)) {
               slideMap.set(ref.slideNumber, {
+                title: ref.title || null,
                 mentions: [ref.timestamp],
                 firstMention: ref.timestamp,
                 context: ref.context
               });
             } else {
-              slideMap.get(ref.slideNumber)?.mentions.push(ref.timestamp);
+              const slide = slideMap.get(ref.slideNumber)!;
+              slide.mentions.push(ref.timestamp);
+              // Update title if we didn't have one before
+              if (!slide.title && ref.title) {
+                slide.title = ref.title;
+              }
             }
           }
-        });
+        }
 
         const slidesData: SlidesData = {
           references: slideRefs,
           uniqueSlides: Array.from(slideMap.entries()).map(([num, data]) => ({
             id: num,
+            title: data.title,
             firstMention: data.firstMention,
             allMentions: data.mentions,
             context: data.context
@@ -533,7 +601,7 @@ program
         await writeFile(slidesFile, JSON.stringify(slidesData, null, 2));
         console.log('Slide references:', slideRefs.length);
         console.log('Unique slides:', slidesData.uniqueSlides.length);
-        console.log(`Slide data saved in: ${slidesFile}`);
+        console.log('Slide data saved in:', slidesFile);
       }
 
       // Format the transcription if requested
