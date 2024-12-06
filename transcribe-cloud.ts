@@ -354,65 +354,133 @@ interface TranscriptSegment {
   text: string;
 }
 
-function consolidateSegments(transcript: string): string {
-  // Parse the transcript into segments
-  const segments: TranscriptSegment[] = transcript.split('\n').map(line => {
+export function formatTimestamp(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
+
+export function consolidateSegments(input: string): string {
+  if (!input) {
+    console.log('Empty input, returning empty string');
+    return '';
+  }
+
+  const lines = input.split('\n');
+  const segments: { timestamp: number; speaker: string; text: string }[] = [];
+
+  // Parse input lines
+  for (const line of lines) {
     const match = line.match(/\[(\d{2}):(\d{2})\] (.*?): (.*)/);
-    if (!match) return null;
-    const [_, minutes, seconds, speaker, text] = match;
-    return {
-      timestamp: parseInt(minutes) * 60 + parseInt(seconds),
-      speaker,
-      text,
-    };
-  }).filter((s): s is TranscriptSegment => s !== null);
-
-  // Consolidate segments
-  const consolidated: TranscriptSegment[] = [];
-  let current: TranscriptSegment | null = null;
-  let currentStartTime: number | null = null;
-
-  for (const segment of segments) {
-    if (!current) {
-      current = segment;
-      currentStartTime = segment.timestamp;
+    if (!match) {
+      console.log('Failed to parse line:', line);
       continue;
     }
 
-    const timeDiff = segment.timestamp - current.timestamp;
-    const totalTimeDiff = segment.timestamp - (currentStartTime || segment.timestamp);
-    const isSameSpeaker = segment.speaker === current.speaker;
-    const isUnderTimeLimit = totalTimeDiff < 30; // Check total time from start of consolidated segment (30s limit)
-    const startsWithSlide = segment.text.toLowerCase().trim().startsWith('going to slide') ||
-      segment.text.toLowerCase().trim().startsWith('slide');
+    const minutes = parseInt(match[1]);
+    const seconds = parseFloat(match[2]);
+    const timestamp = minutes * 60 + seconds;
+    const speaker = match[3];
+    const text = match[4];
 
-    if (isSameSpeaker && isUnderTimeLimit && !startsWithSlide) {
-      current.text += ' ' + segment.text;
+    segments.push({ timestamp, speaker, text });
+    console.log('Parsed segment:', { timestamp, speaker, text: text.slice(0, 20) + '...' });
+  }
+
+  if (segments.length === 0) {
+    console.log('No valid segments found');
+    return '';
+  }
+  if (segments.length === 1) {
+    console.log('Single segment, returning as is');
+    const seg = segments[0];
+    return `[${formatTimestamp(seg.timestamp)}] ${seg.speaker}: ${seg.text}`;
+  }
+
+  // Consolidate segments
+  const consolidated: typeof segments = [];
+  let currentGroup = {
+    lastTimestamp: segments[0].timestamp,
+    timestamp: segments[0].timestamp,
+    speaker: segments[0].speaker,
+    text: segments[0].text,
+    window: Math.floor(segments[0].timestamp / 30)
+  };
+
+  console.log('Starting consolidation with first group:', {
+    timestamp: currentGroup.timestamp,
+    speaker: currentGroup.speaker,
+    text: currentGroup.text.slice(0, 20) + '...'
+  });
+
+  for (let i = 1; i < segments.length; i++) {
+    const current = segments[i];
+    const currentWindow = Math.floor(current.timestamp / 30);
+
+    // Start a new group if:
+    // 1. Current segment is in a different 30-second window
+    // 2. Speaker changes
+    const isNewWindow = currentWindow > currentGroup.window;
+    const isSpeakerChange = current.speaker !== currentGroup.speaker;
+
+    // Determine if there's a long pause (>1.5s) between segments of the same speaker in the same window
+    const timeGap = current.timestamp - currentGroup.lastTimestamp;
+    const isLongPause = !isNewWindow && !isSpeakerChange && timeGap > 1.5;
+
+    console.log(
+      'Processing segment:',
+      {
+        timestamp: current.timestamp,
+        speaker: current.speaker,
+        window: currentWindow,
+        groupWindow: currentGroup.window,
+        isNewWindow,
+        isSpeakerChange
+      },
+      'timeGap:',
+      timeGap,
+      'isLongPause:',
+      isLongPause
+    );
+
+    if (isNewWindow || isSpeakerChange || isLongPause) {
+      console.log('Starting new group');
+      consolidated.push({
+        timestamp: currentGroup.timestamp,
+        speaker: currentGroup.speaker,
+        text: currentGroup.text
+      });
+      currentGroup = {
+        lastTimestamp: current.timestamp,
+        timestamp: current.timestamp,
+        speaker: current.speaker,
+        text: current.text,
+        window: currentWindow
+      };
     } else {
-      consolidated.push(current);
-      current = segment;
-      currentStartTime = segment.timestamp;
+      console.log('Appending to current group');
+      currentGroup.text += ` ${current.text}`;
+      currentGroup.lastTimestamp = current.timestamp;
     }
   }
 
-  if (current) {
-    consolidated.push(current);
-  }
+  consolidated.push({
+    timestamp: currentGroup.timestamp,
+    speaker: currentGroup.speaker,
+    text: currentGroup.text
+  });
 
-  // Format back to string
-  return consolidated.map(segment => {
-    const minutes = Math.floor(segment.timestamp / 60);
-    const seconds = segment.timestamp % 60;
-    const timeStr = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
-    return `${timeStr} ${segment.speaker}: ${segment.text}`;
-  }).join('\n');
+  const result = consolidated
+    .map(seg => `[${formatTimestamp(seg.timestamp)}] ${seg.speaker}: ${seg.text}`)
+    .join('\n');
+
+  console.log('Final output:', result);
+  return result;
 }
 
 interface SlideReference {
-  timestamp: string;
-  slideNumber?: number;
-  title?: string;
-  context: string;
+  timestamp: number;
+  slideNumber: number;
 }
 
 async function extractSlideTimestamps(transcript: string): Promise<SlideReference[]> {
@@ -471,167 +539,201 @@ interface SlidesData {
   }>;
 }
 
-program
-  .name('transcribe-cloud')
-  .description('Transcribe video files using OpenAI Whisper API')
-  .command('transcribe')
-  .description('Transcribe video files using AssemblyAI or Whisper')
-  .argument('<file>', 'video file to transcribe')
-  .option('-d, --duration <minutes>', 'duration to transcribe in minutes')
-  .option('-o, --offset <minutes>', 'start time offset in minutes', '0')
-  .option('-f, --format', 'format transcript with GPT-4', false)
-  .option('-s, --no-slides', 'disable slide extraction', false)
-  .option('-t, --service <service>', 'transcription service to use (assemblyai or whisper)', 'assemblyai')
-  .action(async (file, options) => {
-    try {
-      const startTime = performance.now();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputDir = join('output', timestamp);
-      await mkdir(outputDir, { recursive: true });
+function runCli() {
+  program
+    .name('transcribe-cloud')
+    .description('Transcribe video files using OpenAI Whisper API')
+    .command('transcribe')
+    .description('Transcribe video files using AssemblyAI or Whisper')
+    .argument('<file>', 'video file to transcribe')
+    .option('-d, --duration <minutes>', 'duration to transcribe in minutes')
+    .option('-o, --offset <minutes>', 'start time offset in minutes', '0')
+    .option('-f, --format', 'format transcript with GPT-4', false)
+    .option('-s, --no-slides', 'disable slide extraction', false)
+    .option('-t, --service <service>', 'transcription service to use (assemblyai or whisper)', 'assemblyai')
+    .action(async (file, options) => {
+      try {
+        const startTime = performance.now();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const outputDir = join('output', timestamp);
+        await mkdir(outputDir, { recursive: true });
 
-      console.log('Starting transcription process...');
-      console.log(`Using ${options.service.toUpperCase()} for transcription`);
+        console.log('Starting transcription process...');
+        console.log(`Using ${options.service.toUpperCase()} for transcription`);
 
-      const startSeconds = parseFloat(options.offset) * 60;
-      const duration = options.duration ? parseFloat(options.duration) * 60 : undefined;
+        const startSeconds = parseFloat(options.offset) * 60;
+        const duration = options.duration ? parseFloat(options.duration) * 60 : undefined;
 
-      let audioFile = file;
-      let totalDuration: number;
+        let audioFile = file;
+        let totalDuration: number;
 
-      if (duration) {
-        totalDuration = duration;
-        const trimmedFile = join(outputDir, 'trimmed-audio.mp3');
-        console.log(`Trimming audio from ${startSeconds}s to ${startSeconds + duration}s...`);
-        await execAsync(
-          `ffmpeg -i "${file}" -ss ${startSeconds} -t ${duration} -vn -acodec libmp3lame "${trimmedFile}"`
-        );
-        audioFile = trimmedFile;
-      } else {
-        totalDuration = await getAudioDuration(file);
-      }
-
-      console.log(`Total duration: ${totalDuration} seconds`);
-
-      // For AssemblyAI, we don't need to chunk the file
-      let fullTranscription: TranscriptionResult;
-      if (options.service === 'assemblyai') {
-        fullTranscription = await transcribeWithAssemblyAI(audioFile);
-      } else {
-        // Existing Whisper chunking logic...
-        const CHUNK_SIZE = 24 * 60;
-        const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
-        console.log(`Processing in ${audioChunks} chunks...`);
-
-        let rawParts: string[] = [];
-        for (let i = 0; i < audioChunks; i++) {
-          const chunkStart = i * CHUNK_SIZE;
-          const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
-          console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
-          const chunkResult = await transcribeChunk(
-            openai,
-            audioFile,
-            chunkStart,
-            chunkDuration,
-            outputDir,
-            'whisper'
+        if (duration) {
+          totalDuration = duration;
+          const trimmedFile = join(outputDir, 'trimmed-audio.mp3');
+          console.log(`Trimming audio from ${startSeconds}s to ${startSeconds + duration}s...`);
+          await execAsync(
+            `ffmpeg -i "${file}" -ss ${startSeconds} -t ${duration} -vn -acodec libmp3lame "${trimmedFile}"`
           );
-          rawParts.push(chunkResult.raw);
+          audioFile = trimmedFile;
+        } else {
+          totalDuration = await getAudioDuration(file);
         }
 
-        const rawTranscription = rawParts.join('\n');
-        fullTranscription = {
-          raw: rawTranscription,
-          consolidated: consolidateSegments(rawTranscription)
-        };
-      }
+        console.log(`Total duration: ${totalDuration} seconds`);
 
-      const duration_seconds = ((performance.now() - startTime) / 1000).toFixed(1);
-      console.log(`\nTranscription completed in ${duration_seconds}s`);
+        // For AssemblyAI, we don't need to chunk the file
+        let fullTranscription: TranscriptionResult;
+        if (options.service === 'assemblyai') {
+          fullTranscription = await transcribeWithAssemblyAI(audioFile);
+        } else {
+          // Existing Whisper chunking logic...
+          const CHUNK_SIZE = 24 * 60;
+          const audioChunks = Math.ceil(totalDuration / CHUNK_SIZE);
+          console.log(`Processing in ${audioChunks} chunks...`);
 
-      // Save both versions
-      const rawOutputFile = join(outputDir, 'transcription.raw.txt');
-      const consolidatedOutputFile = join(outputDir, 'transcription.txt');
-      await writeFile(rawOutputFile, fullTranscription.raw);
-      await writeFile(consolidatedOutputFile, fullTranscription.consolidated);
-      console.log(`\nRaw transcript saved in: ${rawOutputFile}`);
-      console.log(`Consolidated transcript saved in: ${consolidatedOutputFile}`);
+          let rawParts: string[] = [];
+          for (let i = 0; i < audioChunks; i++) {
+            const chunkStart = i * CHUNK_SIZE;
+            const chunkDuration = Math.min(CHUNK_SIZE, totalDuration - chunkStart);
+            console.log(`\nProcessing chunk ${i + 1}/${audioChunks} (${chunkDuration}s)...`);
+            const chunkResult = await transcribeChunk(
+              openai,
+              audioFile,
+              chunkStart,
+              chunkDuration,
+              outputDir,
+              'whisper'
+            );
+            rawParts.push(chunkResult.raw);
+          }
 
-      // Extract slide timestamps by default unless disabled
-      if (!options.noSlides) {
-        console.log('\nExtracting slide references...');
-        const slideRefs = await extractSlideTimestamps(fullTranscription.raw);
+          const rawTranscription = rawParts.join('\n');
+          fullTranscription = {
+            raw: rawTranscription,
+            consolidated: consolidateSegments(rawTranscription)
+          };
+        }
 
-        // Group by slide number and create unique slides data
-        const slideMap = new Map<number, {
-          title: string | null;
-          mentions: string[];
-          firstMention: string;
-          context: string;
-        }>();
+        const duration_seconds = ((performance.now() - startTime) / 1000).toFixed(1);
+        console.log(`\nTranscription completed in ${duration_seconds}s`);
 
-        for (const ref of slideRefs) {
-          if (ref.slideNumber) {
-            if (!slideMap.has(ref.slideNumber)) {
-              slideMap.set(ref.slideNumber, {
-                title: ref.title || null,
-                mentions: [ref.timestamp],
-                firstMention: ref.timestamp,
-                context: ref.context
-              });
-            } else {
-              const slide = slideMap.get(ref.slideNumber)!;
-              slide.mentions.push(ref.timestamp);
-              // Update title if we didn't have one before
-              if (!slide.title && ref.title) {
-                slide.title = ref.title;
+        // Save both versions
+        const rawOutputFile = join(outputDir, 'transcription.raw.txt');
+        const consolidatedOutputFile = join(outputDir, 'transcription.txt');
+        await writeFile(rawOutputFile, fullTranscription.raw);
+        await writeFile(consolidatedOutputFile, fullTranscription.consolidated);
+        console.log(`\nRaw transcript saved in: ${rawOutputFile}`);
+        console.log(`Consolidated transcript saved in: ${consolidatedOutputFile}`);
+
+        // Extract slide timestamps by default unless disabled
+        if (!options.noSlides) {
+          console.log('\nExtracting slide references...');
+          const slideRefs = await extractSlideTimestamps(fullTranscription.raw);
+
+          // Group by slide number and create unique slides data
+          const slideMap = new Map<number, {
+            title: string | null;
+            mentions: string[];
+            firstMention: string;
+            context: string;
+          }>();
+
+          for (const ref of slideRefs) {
+            if (ref.slideNumber) {
+              if (!slideMap.has(ref.slideNumber)) {
+                slideMap.set(ref.slideNumber, {
+                  title: ref.title || null,
+                  mentions: [ref.timestamp],
+                  firstMention: ref.timestamp,
+                  context: ref.context
+                });
+              } else {
+                const slide = slideMap.get(ref.slideNumber)!;
+                slide.mentions.push(ref.timestamp);
+                // Update title if we didn't have one before
+                if (!slide.title && ref.title) {
+                  slide.title = ref.title;
+                }
               }
             }
           }
+
+          const slidesData: SlidesData = {
+            references: slideRefs,
+            uniqueSlides: Array.from(slideMap.entries()).map(([num, data]) => ({
+              id: num,
+              title: data.title,
+              firstMention: data.firstMention,
+              allMentions: data.mentions,
+              context: data.context
+            }))
+          };
+
+          const slidesFile = join(outputDir, 'slides.json');
+          await writeFile(slidesFile, JSON.stringify(slidesData, null, 2));
+          console.log('Slide references:', slideRefs.length);
+          console.log('Unique slides:', slidesData.uniqueSlides.length);
+          console.log('Slide data saved in:', slidesFile);
         }
 
-        const slidesData: SlidesData = {
-          references: slideRefs,
-          uniqueSlides: Array.from(slideMap.entries()).map(([num, data]) => ({
-            id: num,
-            title: data.title,
-            firstMention: data.firstMention,
-            allMentions: data.mentions,
-            context: data.context
-          }))
-        };
+        // Format the transcription if requested
+        if (options.format) {
+          await formatTranscription(fullTranscription.raw, outputDir);
+        }
 
-        const slidesFile = join(outputDir, 'slides.json');
-        await writeFile(slidesFile, JSON.stringify(slidesData, null, 2));
-        console.log('Slide references:', slideRefs.length);
-        console.log('Unique slides:', slidesData.uniqueSlides.length);
-        console.log('Slide data saved in:', slidesFile);
+      } catch (error) {
+        console.error('Error during transcription:', error);
+        process.exit(1);
       }
+    });
 
-      // Format the transcription if requested
-      if (options.format) {
-        await formatTranscription(fullTranscription.raw, outputDir);
+  // Add new command to format existing transcription
+  program
+    .command('format')
+    .description('Format an existing transcription file with speaker names and timestamps')
+    .argument('<file>', 'transcription file to format')
+    .action(async (file) => {
+      try {
+        const inputDir = join(file, '..');
+        const transcription = await readFile(file, 'utf-8');
+        await formatTranscription(transcription, inputDir);
+      } catch (error) {
+        console.error('Error during formatting:', error);
+        process.exit(1);
       }
+    });
 
-    } catch (error) {
-      console.error('Error during transcription:', error);
-      process.exit(1);
-    }
-  });
+  // Add new command to reprocess existing transcript
+  program
+    .command('reprocess')
+    .description('Reprocess an existing transcript with updated consolidation logic')
+    .argument('<file>', 'transcript file to reprocess')
+    .action(async (file) => {
+      try {
+        const transcript = await readFile(file, 'utf-8');
 
-// Add new command to format existing transcription
-program
-  .command('format')
-  .description('Format an existing transcription file with speaker names and timestamps')
-  .argument('<file>', 'transcription file to format')
-  .action(async (file) => {
-    try {
-      const inputDir = join(file, '..');
-      const transcription = await readFile(file, 'utf-8');
-      await formatTranscription(transcription, inputDir);
-    } catch (error) {
-      console.error('Error during formatting:', error);
-      process.exit(1);
-    }
-  });
+        // Use the existing output directory
+        const outputDir = dirname(file);
 
-program.parse(); 
+        // Consolidate the transcript
+        const consolidated = consolidateSegments(transcript);
+
+        // Save consolidated version in same directory
+        const consolidatedOutputFile = join(outputDir, 'transcription.consolidated.txt');
+        await writeFile(consolidatedOutputFile, consolidated);
+
+        console.log(`Reprocessed transcript saved to: ${consolidatedOutputFile}`);
+
+      } catch (error) {
+        console.error('Error during reprocessing:', error);
+        process.exit(1);
+      }
+    });
+
+  program.parse();
+}
+
+// Only run CLI if this file is being run directly
+if (import.meta.main) {
+  runCli();
+} 

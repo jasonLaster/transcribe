@@ -1,6 +1,13 @@
-use typescript
-use bun
-run tsc after each proposed change and make sure the types are correct
-prefer gpt-4o over gpt-4
+Tooling:
+- use typescript
+- use bun
+- use bun test
 
-prefer await to .then()
+Process:
+- run tsc after each proposed change and make sure the types are correct
+- run tests after each proposed change and make sure the tests pass
+
+Style:
+- prefer await to .then()
+- prefer gpt-4o over gpt-4
+
